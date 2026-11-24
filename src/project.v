@@ -1,27 +1,152 @@
-/*
- * Copyright (c) 2024 Your Name
- * SPDX-License-Identifier: Apache-2.0
- */
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
-`default_nettype none
+entity tt_um_example is
+    generic (
+        CLK_HZ : integer := 50_000_000
+    );
+    port (
+        ui_in   : in  std_logic_vector(7 downto 0);
+        uo_out  : out std_logic_vector(7 downto 0);
+        uio_in  : in  std_logic_vector(7 downto 0);
+        uio_out : out std_logic_vector(7 downto 0);
+        uio_oe  : out std_logic_vector(7 downto 0);
+        ena     : in  std_logic;
+        clk     : in  std_logic;
+        rst_n   : in  std_logic
+    );
+end entity;
 
-module tt_um_example (
-    input  wire [7:0] ui_in,    // Dedicated inputs
-    output wire [7:0] uo_out,   // Dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: Input path
-    output wire [7:0] uio_out,  // IOs: Output path
-    output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
-    input  wire       ena,      // always 1 when the design is powered, so you can ignore it
-    input  wire       clk,      // clock
-    input  wire       rst_n     // reset_n - low to reset
-);
+architecture rtl of tt_um_example is
+    signal pwm_in        : std_logic;
+    signal pwm_ff1       : std_logic := '0';
+    signal pwm_ff2       : std_logic := '0';
+    signal level_0_9     : integer range 0 to 9 := 0;
+    signal active_on     : std_logic := '0';
+    signal inj_reg       : std_logic_vector(5 downto 0) := (others => '0');
+    signal ch_idx        : integer range 0 to 5 := 0;
+    signal period_cnt    : integer := 0;
+    signal pulse_cnt     : integer := 0;
+    signal relay_bomba   : std_logic := '0';
+    signal seg7          : std_logic_vector(6 downto 0);
+    signal unused_acc    : std_logic;
 
-  // All output pins must be assigned. If not used, assign to 0.
-  assign uo_out  = ui_in + uio_in;  // Example: ou_out is the sum of ui_in and uio_in
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+    constant PWM_WIN_TICKS : integer := CLK_HZ / 20;
+    constant PULSE_TICKS   : integer := CLK_HZ / 50;
+begin
 
-  // List all unused inputs to prevent warnings
-  wire _unused = &{ena, clk, rst_n, 1'b0};
+    pwm_in <= ui_in(0);
+    uio_oe <= "01111111"; -- uio(6 downto 0) como salida; uio(7) como entrada
+    unused_acc <= ena or uio_in(0) or ui_in(1);
 
-endmodule
+    process(clk, rst_n)
+        variable high_cnt : integer := 0;
+        variable win_cnt  : integer := 0;
+        variable calc_lvl : integer;
+    begin
+        if rst_n = '0' then
+            pwm_ff1   <= '0';
+            pwm_ff2   <= '0';
+            level_0_9 <= 0;
+            active_on <= '0';
+            high_cnt  := 0;
+            win_cnt   := 0;
+        elsif rising_edge(clk) then
+            pwm_ff1 <= pwm_in;
+            pwm_ff2 <= pwm_ff1;
+
+            if pwm_ff2 = '1' then
+                high_cnt := high_cnt + 1;
+            end if;
+
+            if win_cnt >= PWM_WIN_TICKS - 1 then
+                calc_lvl := (high_cnt * 10) / PWM_WIN_TICKS;
+                if high_cnt = 0 then
+                    level_0_9 <= 0;
+                    active_on <= '0';
+                else
+                    active_on <= '1';
+                    if calc_lvl > 9 then
+                        level_0_9 <= 9;
+                    elsif calc_lvl < 1 then
+                        level_0_9 <= 1;
+                    else
+                        level_0_9 <= calc_lvl;
+                    end if;
+                end if;
+                high_cnt := 0;
+                win_cnt  := 0;
+            else
+                win_cnt := win_cnt + 1;
+            end if;
+        end if;
+    end process;
+
+    relay_bomba <= '1' when (rst_n = '1' and active_on = '1') else '0';
+
+    process(clk, rst_n)
+        variable period_target : integer;
+    begin
+        if rst_n = '0' then
+            period_cnt <= 0;
+            pulse_cnt  <= 0;
+            ch_idx     <= 0;
+            inj_reg    <= (others => '0');
+        elsif rising_edge(clk) then
+            if (active_on = '0') or (level_0_9 = 0) then
+                period_cnt <= 0;
+                pulse_cnt  <= 0;
+                ch_idx     <= 0;
+                inj_reg    <= (others => '0');
+            else
+                period_target := CLK_HZ / level_0_9;
+                if period_target < (PULSE_TICKS + 10) then
+                    period_target := PULSE_TICKS + 10;
+                end if;
+
+                if period_cnt >= period_target then
+                    period_cnt <= 0;
+                    pulse_cnt  <= PULSE_TICKS;
+                    inj_reg    <= (others => '0');
+                    inj_reg(ch_idx) <= '1';
+
+                    if ch_idx = 5 then
+                        ch_idx <= 0;
+                    else
+                        ch_idx <= ch_idx + 1;
+                    end if;
+                else
+                    period_cnt <= period_cnt + 1;
+                    if pulse_cnt > 0 then
+                        pulse_cnt <= pulse_cnt - 1;
+                    else
+                        inj_reg <= (others => '0');
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    uo_out <= '0' & relay_bomba & inj_reg;
+
+    process(level_0_9)
+    begin
+        case level_0_9 is
+            when 0      => seg7 <= "1000000";
+            when 1      => seg7 <= "1111001";
+            when 2      => seg7 <= "0100100";
+            when 3      => seg7 <= "0110000";
+            when 4      => seg7 <= "0011001";
+            when 5      => seg7 <= "0010010";
+            when 6      => seg7 <= "0000010";
+            when 7      => seg7 <= "0111000";
+            when 8      => seg7 <= "0000000";
+            when 9      => seg7 <= "0010000";
+            when others => seg7 <= "1000000";
+        end case;
+    end process;
+
+    uio_out <= '0' & seg7;
+
+end architecture;
